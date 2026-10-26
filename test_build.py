@@ -1,216 +1,105 @@
 #!/usr/bin/env python3
-"""
-Fabrique horaires-H.json (le format lu par l'appli Contrôle H) à partir du GTFS d'Île-de-France Mobilités.
-
-Usage :
-    python build_horaires.py --gtfs IDFM-gtfs.zip --out horaires-H.json
-    python build_horaires.py --gtfs dossier_gtfs/ --route IDFM:C01737 --out horaires-H.json
-
-Format produit (celui que le Worker attend) :
-{
-  "version": "...", "cree_le": "AAAA-MM-JJ", "valide_du": "AAAA-MM-JJ", "valide_au": "AAAA-MM-JJ",
-  "gares":      [[id, nom], ...],
-  "services":   [[id, "1111100", "AAAA-MM-JJ", "AAAA-MM-JJ"], ...],   # 7 chiffres : lundi..dimanche
-  "exceptions": [[id_service, "AAAA-MM-JJ", 1|2], ...],               # 1 = circule, 2 = ne circule pas
-  "trains":     [[id, "numéro", id_service], ...],
-  "arrets":     [[id_train, rang, id_gare, arrivée_en_secondes, départ_en_secondes], ...]
-}
-"""
-import argparse
-import csv
-import io
+"""Test : fabrique un petit GTFS factice, lance build_horaires.py, puis vérifie le résultat
+avec les mêmes règles que le Worker (formats, entiers, dates, cohérence)."""
 import json
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import zipfile
-from datetime import date, datetime, timezone
 
-ROUTE_H = "IDFM:C01737"   # ligne H (même identifiant que line:IDFM:C01737 côté PRIM)
+GTFS = {
+    "routes.txt": "route_id,route_short_name,route_type\nIDFM:C01737,H,2\nIDFM:C01727,A,2\n",
+    "stops.txt": (
+        "stop_id,stop_name,location_type,parent_station\n"
+        "IDFM:monomodalStopPlace:462394,Paris Gare du Nord,1,\n"
+        "IDFM:monomodalStopPlace:43078,Épinay - Villetaneuse,1,\n"
+        "IDFM:monomodalStopPlace:43178,Persan - Beaumont,1,\n"
+        "IDFM:470724,Quai PNO,0,IDFM:monomodalStopPlace:462394\n"
+    ),
+    "calendar.txt": (
+        "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n"
+        "S1,1,1,1,1,1,0,0,20261101,20261130\n"
+    ),
+    "calendar_dates.txt": (
+        "service_id,date,exception_type\n"
+        "S1,20261111,2\n"
+        "S2,20261128,1\n"
+    ),
+    "trips.txt": (
+        "route_id,service_id,trip_id,trip_headsign,trip_short_name\n"
+        "IDFM:C01737,S1,T1,Persan,124650\n"
+        "IDFM:C01737,S2,T2,Gare du Nord,125754\n"
+        "IDFM:C01727,S1,T3,Autre ligne,999999\n"
+    ),
+    "stop_times.txt": (
+        "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        "T1,11:00:00,11:00:00,IDFM:470724,1\n"
+        "T1,11:12:00,11:13:00,IDFM:monomodalStopPlace:43078,2\n"
+        "T1,12:05:00,12:05:00,IDFM:monomodalStopPlace:43178,3\n"
+        "T2,24:10:00,24:10:00,IDFM:monomodalStopPlace:43178,1\n"
+        "T2,25:07:30,25:07:30,IDFM:monomodalStopPlace:462394,2\n"
+        "T3,10:00:00,10:00:00,IDFM:monomodalStopPlace:462394,1\n"
+        "T3,10:30:00,10:30:00,IDFM:monomodalStopPlace:43178,2\n"
+    ),
+}
 
-
-class Source:
-    """Lit les fichiers d'un GTFS, qu'il soit zippé ou déjà décompressé."""
-
-    def __init__(self, chemin):
-        self.chemin = chemin
-        self.zip = zipfile.ZipFile(chemin) if os.path.isfile(chemin) else None
-
-    def existe(self, nom):
-        if self.zip:
-            return nom in self.zip.namelist()
-        return os.path.isfile(os.path.join(self.chemin, nom))
-
-    def lignes(self, nom):
-        if self.zip:
-            flux = io.TextIOWrapper(self.zip.open(nom), encoding="utf-8-sig", newline="")
-        else:
-            flux = open(os.path.join(self.chemin, nom), encoding="utf-8-sig", newline="")
-        with flux:
-            for ligne in csv.DictReader(flux):
-                yield ligne
-
-
-def secondes(h):
-    """« 25:07:30 » -> 90450. Les horaires après minuit dépassent 24 h dans le GTFS."""
-    h, m, s = (h.strip().split(":") + ["0", "0"])[:3]
-    return int(h) * 3600 + int(m) * 60 + int(s)
-
-
-def date_iso(d):
-    d = d.strip()
-    return "%s-%s-%s" % (d[0:4], d[4:6], d[6:8])
-
-
-def numero_fin(identifiant):
-    m = re.search(r"(\d+)$", identifiant)
-    return int(m.group(1)) if m else None
+RE_HEURE_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--gtfs", required=True, help="GTFS zippé ou dossier")
-    ap.add_argument("--route", default=ROUTE_H, help="route_id de la ligne (défaut : %s)" % ROUTE_H)
-    ap.add_argument("--out", default="horaires-H.json")
-    ap.add_argument("--meta", default="", help="petit fichier meta.json (dates de validité) pour savoir sans tout télécharger si les horaires ont changé")
-    a = ap.parse_args()
-
-    src = Source(a.gtfs)
-    for f in ("routes.txt", "trips.txt", "stop_times.txt", "stops.txt"):
-        if not src.existe(f):
-            sys.exit("Fichier manquant dans le GTFS : " + f)
-
-    # 1. la ligne
-    if not any(r["route_id"] == a.route for r in src.lignes("routes.txt")):
-        sys.exit("Ligne %s introuvable dans routes.txt" % a.route)
-
-    # 2. les trains de la ligne
-    trips = {}   # trip_id -> (numéro, service_id)
-    for t in src.lignes("trips.txt"):
-        if t["route_id"] != a.route:
-            continue
-        numero = (t.get("trip_short_name") or "").strip()
-        if not numero:
-            fin = re.findall(r"\d{4,}", t["trip_id"])
-            numero = fin[-1] if fin else t["trip_id"]
-        trips[t["trip_id"]] = (numero[:20], t["service_id"])
-    if not trips:
-        sys.exit("Aucun train pour la ligne " + a.route)
-
-    # 3. les arrêts de ces trains (fichier très gros : lecture au fil de l'eau)
-    arrets_par_train = {}
-    for st in src.lignes("stop_times.txt"):
-        tid = st["trip_id"]
-        if tid not in trips:
-            continue
-        arr = st.get("arrival_time") or st.get("departure_time")
-        dep = st.get("departure_time") or st.get("arrival_time")
-        if not arr or not dep:
-            continue     # arrêt sans horaire : on l'ignore
-        arrets_par_train.setdefault(tid, []).append((int(st["stop_sequence"]), st["stop_id"], secondes(arr), secondes(dep)))
-
-    # 4. les gares : on remonte du quai à la gare (parent_station)
-    stops = {s["stop_id"]: s for s in src.lignes("stops.txt")}
-
-    def gare_de(stop_id):
-        s = stops.get(stop_id)
-        if s is None:
-            return None, None
-        parent = (s.get("parent_station") or "").strip()
-        if parent and parent in stops:
-            s = stops[parent]
-        return numero_fin(s["stop_id"]), s["stop_name"].strip()
-
-    # 5. les services (jours de circulation)
-    cal = {}
-    if src.existe("calendar.txt"):
-        for c in src.lignes("calendar.txt"):
-            jours = "".join(c[j].strip() for j in ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"))
-            cal[c["service_id"]] = (jours, date_iso(c["start_date"]), date_iso(c["end_date"]))
-    exc = {}
-    if src.existe("calendar_dates.txt"):
-        for e in src.lignes("calendar_dates.txt"):
-            exc.setdefault(e["service_id"], []).append((date_iso(e["date"]), int(e["exception_type"])))
-
-    utiles = sorted({s for _, s in trips.values()})
-    num_service, services, exceptions = {}, [], []
-    for i, sid in enumerate(utiles, 1):
-        num_service[sid] = i
-        if sid in cal:
-            jours, d0, d1 = cal[sid]
-        else:   # service décrit uniquement par des dates
-            ds = [d for d, _ in exc.get(sid, [])]
-            if not ds:
-                continue
-            jours, d0, d1 = "0000000", min(ds), max(ds)
-        services.append([i, jours, d0, d1])
-        for d, t in exc.get(sid, []):
-            if t in (1, 2):
-                exceptions.append([i, d, t])
-    connus = set(sv[0] for sv in services)   # services dont on connaît les jours de circulation
-
-    # 6. assemblage
-    gares, trains, arrets = {}, [], []
-    tid_num = 0
-    sans_calendrier = sans_horaires = trop_courts = 0
-    for tid, (numero, sid) in sorted(trips.items(), key=lambda kv: kv[0]):
-        sv = num_service.get(sid)
-        if sv is None or sv not in connus:
-            sans_calendrier += 1
-            continue
-        lst = sorted(arrets_par_train.get(tid, []))
-        if not lst:
-            sans_horaires += 1
-        lignes = []
-        for _, stop_id, arr, dep in lst:
-            gid, nom = gare_de(stop_id)
-            if gid is None:
-                continue
-            if lignes and lignes[-1][0] == gid:     # deux quais de la même gare à la suite
-                lignes[-1] = (gid, lignes[-1][1], dep)
-                continue
-            lignes.append((gid, arr, dep))
-            gares[gid] = nom
-        if len(lignes) < 2:
-            if lst:
-                trop_courts += 1
-            continue
-        tid_num += 1
-        trains.append([tid_num, numero, sv])
-        for rang, (gid, arr, dep) in enumerate(lignes):
-            arrets.append([tid_num, rang, gid, arr, dep])
-
-    if not trains:
-        sys.exit("Aucun train exploitable : vérifiez le GTFS")
-
-    debut = min(s[2] for s in services)
-    fin = max(s[3] for s in services)
-    out = {
-        "version": "gtfs-idfm " + a.route,
-        "cree_le": date.today().isoformat(),
-        "valide_du": debut,
-        "valide_au": fin,
-        "gares": sorted([[g, n] for g, n in gares.items()], key=lambda x: x[0]),
-        "services": [s for s in services if s[0] in connus],
-        "exceptions": [e for e in exceptions if e[0] in connus],
-        "trains": trains,
-        "arrets": arrets,
-    }
-    with open(a.out, "w", encoding="utf-8") as f:
-        json.dump(out, f, ensure_ascii=False, separators=(",", ":"))
-    # diagnostic : où part chaque train de trips.txt ?
-    print("diagnostic : %d trains pour la ligne dans trips.txt (%d numéros distincts) ; gardés %d ; "
-          "écartés : %d sans calendrier connu, %d sans horaires dans stop_times.txt, %d avec moins de 2 gares ; "
-          "%d services, %d exceptions" % (
-              len(trips), len({n for n, _ in trips.values()}), len(trains),
-              sans_calendrier, sans_horaires, trop_courts, len(out["services"]), len(out["exceptions"])))
-    if a.meta:
-        with open(a.meta, "w", encoding="utf-8") as f:
-            json.dump({"cree_le": out["cree_le"], "valide_du": debut, "valide_au": fin,
-                       "trains": len(trains), "gares": len(gares), "arrets": len(arrets)}, f)
-    print("%s : %d trains, %d gares, %d arrêts, du %s au %s (%d Ko)" % (
-        a.out, len(trains), len(gares), len(arrets), debut, fin, os.path.getsize(a.out) // 1024))
+def ok(cond, msg):
+    if not cond:
+        print("ÉCHEC :", msg)
+        sys.exit(1)
 
 
-if __name__ == "__main__":
-    main()
+def entier(v, lo, hi):
+    return isinstance(v, int) and not isinstance(v, bool) and lo <= v <= hi
+
+
+with tempfile.TemporaryDirectory() as d:
+    zpath = os.path.join(d, "gtfs.zip")
+    with zipfile.ZipFile(zpath, "w") as z:
+        for nom, txt in GTFS.items():
+            z.writestr(nom, "\ufeff" + txt)      # avec BOM, comme certains exports
+    sortie = os.path.join(d, "h.json")
+    here = os.path.dirname(os.path.abspath(__file__))
+    meta = os.path.join(d, "meta.json")
+    r = subprocess.run([sys.executable, os.path.join(here, "build_horaires.py"), "--gtfs", zpath, "--out", sortie, "--meta", meta],
+                       capture_output=True, text=True)
+    print(r.stdout.strip(), r.stderr.strip())
+    ok(r.returncode == 0, "le script a échoué")
+    j = json.load(open(sortie, encoding="utf-8"))
+    m = json.load(open(meta, encoding="utf-8"))
+    ok(m["valide_au"] == j["valide_au"] and m["trains"] == len(j["trains"]) and "cree_le" in m, "meta.json incohérent")
+
+# mêmes contrôles que le Worker
+ok(all(k in j for k in ("gares", "trains", "arrets", "services", "exceptions", "version", "cree_le", "valide_du", "valide_au")), "clés manquantes")
+ok(RE_HEURE_DATE.match(j["valide_du"]) and RE_HEURE_DATE.match(j["valide_au"]), "dates de validité")
+ok(len(j["trains"]) == 2, "seuls les 2 trains de la ligne H doivent rester, trouvé %d" % len(j["trains"]))
+ok(len(j["gares"]) == 3, "3 gares attendues, trouvé %d" % len(j["gares"]))
+for g in j["gares"]:
+    ok(entier(g[0], 1, 10**6) and isinstance(g[1], str), "gare %r" % (g,))
+for s in j["services"]:
+    ok(entier(s[0], 1, 10**6) and re.match(r"^[01]{7}$", s[1]) and RE_HEURE_DATE.match(s[2]) and RE_HEURE_DATE.match(s[3]), "service %r" % (s,))
+ids_services = set(s[0] for s in j["services"])
+for e in j["exceptions"]:
+    ok(e[0] in ids_services and RE_HEURE_DATE.match(e[1]) and e[2] in (1, 2), "exception %r" % (e,))
+for t in j["trains"]:
+    ok(entier(t[0], 1, 10**7) and len(t[1]) <= 20 and t[2] in ids_services, "train %r" % (t,))
+ids_gares = set(g[0] for g in j["gares"])
+for a in j["arrets"]:
+    ok(entier(a[0], 1, 10**7) and entier(a[1], 0, 10000) and a[2] in ids_gares and entier(a[3], 0, 400000) and entier(a[4], 0, 400000), "arrêt %r" % (a,))
+
+# cas particuliers
+numeros = {t[1] for t in j["trains"]}
+ok(numeros == {"124650", "125754"}, "numéros des trains : %r" % numeros)
+t2 = [t for t in j["trains"] if t[1] == "125754"][0][0]
+arr_t2 = [a for a in j["arrets"] if a[0] == t2]
+ok(arr_t2[-1][3] == 25 * 3600 + 7 * 60 + 30, "horaire après minuit mal converti")
+ok(arr_t2[0][1] == 0 and arr_t2[1][1] == 1, "rangs des arrêts")
+ok(any(e[1] == "2026-11-11" and e[2] == 2 for e in j["exceptions"]), "exception de suppression perdue")
+s2 = [s for s in j["services"] if s[1] == "0000000"]
+ok(len(s2) == 1 and s2[0][2] == "2026-11-28", "service décrit uniquement par des dates")
+print("OK : le fichier produit respecte le format attendu par le Worker.")
