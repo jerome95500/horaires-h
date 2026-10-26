@@ -152,11 +152,15 @@ def main():
     # 6. assemblage
     gares, trains, arrets = {}, [], []
     tid_num = 0
+    sans_calendrier = sans_horaires = trop_courts = 0
     for tid, (numero, sid) in sorted(trips.items(), key=lambda kv: kv[0]):
         sv = num_service.get(sid)
         if sv is None or sv not in connus:
+            sans_calendrier += 1
             continue
         lst = sorted(arrets_par_train.get(tid, []))
+        if not lst:
+            sans_horaires += 1
         lignes = []
         for _, stop_id, arr, dep in lst:
             gid, nom = gare_de(stop_id)
@@ -168,6 +172,8 @@ def main():
             lignes.append((gid, arr, dep))
             gares[gid] = nom
         if len(lignes) < 2:
+            if lst:
+                trop_courts += 1
             continue
         tid_num += 1
         trains.append([tid_num, numero, sv])
@@ -192,6 +198,12 @@ def main():
     }
     with open(a.out, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, separators=(",", ":"))
+    # diagnostic : où part chaque train de trips.txt ?
+    print("diagnostic : %d trains pour la ligne dans trips.txt (%d numéros distincts) ; gardés %d ; "
+          "écartés : %d sans calendrier connu, %d sans horaires dans stop_times.txt, %d avec moins de 2 gares ; "
+          "%d services, %d exceptions" % (
+              len(trips), len({n for n, _ in trips.values()}), len(trains),
+              sans_calendrier, sans_horaires, trop_courts, len(out["services"]), len(out["exceptions"])))
     if a.meta:
         with open(a.meta, "w", encoding="utf-8") as f:
             json.dump({"cree_le": out["cree_le"], "valide_du": debut, "valide_au": fin,
