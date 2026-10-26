@@ -1,0 +1,58 @@
+name: Horaires ligne H
+
+# Fabrique horaires-H.json chaque semaine à partir du GTFS d'Île-de-France Mobilités
+# et le publie sur la branche « data » du dépôt. Le GTFS d'IDFM ne couvre que les ~30 prochains jours :
+# une mise à jour hebdomadaire garde toujours au moins trois semaines d'avance.
+on:
+  schedule:
+    - cron: "23 4 * * 1"      # chaque lundi, 4 h 23 UTC (5 h 23 ou 6 h 23 à Paris)
+  workflow_dispatch:           # bouton « Run workflow » pour le lancer à la main
+
+permissions:
+  contents: write
+
+jobs:
+  horaires:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Tester le script de conversion
+        run: python test_build.py
+
+      - name: Télécharger le GTFS d'Île-de-France Mobilités
+        env:
+          GTFS_URL: ${{ vars.GTFS_URL }}
+          GTFS_APIKEY: ${{ secrets.GTFS_APIKEY }}
+        run: |
+          URL="${GTFS_URL:-https://eu.ftp.opendatasoft.com/stif/GTFS/IDFM-gtfs.zip}"
+          echo "Téléchargement : $URL"
+          if [ -n "$GTFS_APIKEY" ]; then ENTETE="apikey: $GTFS_APIKEY"; else ENTETE="Accept: */*"; fi
+          if ! curl -fL --retry 3 --retry-delay 10 -H "$ENTETE" -o gtfs.zip "$URL"; then
+            echo "::error::Téléchargement impossible. Vérifiez la variable GTFS_URL (Settings > Secrets and variables > Actions > Variables) et, si le lien exige une clé, le secret GTFS_APIKEY."
+            exit 1
+          fi
+          if ! unzip -tq gtfs.zip > /dev/null; then
+            echo "::error::Le fichier téléchargé n'est pas un zip GTFS valide (lien expiré ou page de connexion ?)."
+            exit 1
+          fi
+
+      - name: Fabriquer horaires-H.json
+        run: python build_horaires.py --gtfs gtfs.zip --out horaires-H.json --meta meta.json
+
+      - name: Publier sur la branche data
+        run: |
+          mkdir out
+          cp horaires-H.json meta.json out/
+          cd out
+          git init -q -b data
+          git config user.name "github-actions"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add horaires-H.json meta.json
+          git commit -q -m "Horaires ligne H du $(date -u +%F)"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" data
